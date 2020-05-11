@@ -1,6 +1,10 @@
 *.a
 *.o
 .deps
+.idea
+.vs
+cmake*
+out/
 Makefile
 Makefile.in
 
