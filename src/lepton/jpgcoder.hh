@@ -8,6 +8,7 @@
 #include "../vp8/util/nd_array.hh"
 #include "../vp8/util/options.hh"
 #include "../io/Reader.hh"
+#include "../io/MuxReader.hh"
 
 //extern int cmpc;
 extern uint8_t get_current_file_lepton_version();
@@ -19,8 +20,9 @@ namespace IOUtil {
 	class FileReader;
 	class FileWriter;
 }
-
 void gen_nop();
+
+ExitCode compress_file_to_lepton_data(const char *ifilename, const char *executable, Sirikata::MuxReader::ResizableByteBuffer *lepton_data);
 void process_file(IOUtil::FileReader *reader,
 				  IOUtil::FileWriter *writer,
 				  int file_input_length,

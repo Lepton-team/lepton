@@ -85,7 +85,6 @@ volatile int volatile1024 = 1024;
 #include "../io/Seccomp.hh"
 #include "../vp8/encoder/vpx_bool_writer.hh"
 #include "generic_compress.hh"
-#include "WLep_header.hh"
 
 #ifdef EMSCRIPTEN
 #include <emscripten.h>
@@ -386,8 +385,6 @@ int max_cmp = 0; // the maximum component in a truncated image
 int max_bpos = 0; // the maximum band in a truncated image
 int max_dpos[4] = {}; // the maximum dpos in a truncated image
 int max_sah = 0; // the maximum bit in a truncated image
-
-const std::string wlep_version = "0.1";
 
 void standard_eof(abytewriter *hdrw, abytewriter *huffw) {
 	// get pointer for header data & size
@@ -802,7 +799,73 @@ int EMSCRIPTEN_KEEPALIVE main(void) {
 	return error_cnt == 0 ? 0 : 1;
 }
 #else
+int open_fdin(const char *ifilename,
+			  IOUtil::FileReader *reader,
+			  Sirikata::Array1d<uint8_t, 2> &header,
+			  ssize_t *bytes_read,
+			  bool *is_socket);
+
+int open_fdout(const char *ifilename,
+			   IOUtil::FileWriter *writer,
+			   bool is_embedded_jpeg,
+			   Sirikata::Array1d<uint8_t, 2> fileid,
+			   bool force_compressed_output,
+			   bool *is_socket);
+
+int open_file(const char *filename) {
+	return open(filename, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0 | S_IREAD | S_IWRITE);
+}
+
+size_t write_data_to_file(const char *filename, Sirikata::MuxReader::ResizableByteBuffer *lepton_data) {
+	int fdout = open_file(filename);
+	size_t data_sent = 0;
+	while (data_sent < lepton_data->size()) {
+		ssize_t sent = write(fdout, lepton_data->data() + data_sent, lepton_data->size() - data_sent);
+		if (sent < 0 && errno == EINTR) {
+			continue;
+		}
+		if (sent <= 0) {
+			custom_exit(ExitCode::SHORT_READ);
+		}
+		data_sent += sent;
+	}
+	close(fdout);
+
+	return data_sent;
+}
+
+ExitCode compress_file_to_lepton_data(const char *ifilename, const char *executable, Sirikata::MuxReader::ResizableByteBuffer *lepton_data) {
+	bool is_socket = false;
+	ssize_t bytes_read = 0;
+
+	Sirikata::Array1d<uint8_t, 2> header = {{0, 0}};
+	ExitCode validation_exit_code = ExitCode::CODING_ERROR;
+	std::vector<uint8_t> permissive_jpeg_return_backing;
+
+	int fdin = open_fdin(ifilename, nullptr, header, &bytes_read, &is_socket);
+	const int argc = 2;
+	const char *argv[argc] = {executable, ifilename};
+
+	compress_file(&fdin,
+				  header,
+				  bytes_read,
+				  0, 0,
+				  &validation_exit_code,
+				  &(*lepton_data),
+				  argc,
+				  argv,
+				  &is_socket,
+				  NULL);
+
+	return validation_exit_code;
+}
+
 int app_main(int argc, char **argv) {
+	fprintf(stderr, "Hello there arguments: \n");
+	for (int i = 0; i < argc; i++) {
+		fprintf(stderr, "argv[%d] = %s\n", i, argv[i]);
+	}
+
 	g_argc = argc;
 	g_argv = (const char **)argv;
 	TimingHarness::timing[0][TimingHarness::TS_MAIN]
@@ -890,6 +953,16 @@ int app_main(int argc, char **argv) {
 
 	// read options from command line
 	int max_file_size = initialize_options(argc, argv);
+
+	if (!g_skip_validation) {
+		Sirikata::MuxReader::ResizableByteBuffer lepton_data;
+		ExitCode compress_code = compress_file_to_lepton_data("test.jpg", argv[0], &lepton_data);
+
+		if (compress_code == ExitCode::SUCCESS) {
+			write_data_to_file("asdf.wlep", &lepton_data);
+		}
+	}
+
 	if (action != forkserve && action != socketserve) {
 		// write program info to screen
 		fprintf(msgout, "%s v%i.0-%s\n",
@@ -1541,8 +1614,6 @@ void process_file(IOUtil::FileReader *reader,
 		}*/
 	int fdout = -1;
 
-	WLep::WLep_header wlep_header = WLep::WLep_header(wlep_version, std::string(ifilename));
-
 	if ((embedded_jpeg || is_jpeg_header(header) || g_permissive) && (g_permissive || !g_skip_validation)) {
 		//fprintf(stderr, "ENTERED VALIDATION...\n");
 		ExitCode validation_exit_code = ExitCode::SUCCESS;
@@ -1559,7 +1630,7 @@ void process_file(IOUtil::FileReader *reader,
 									is_socket,
 									g_permissive ? &permissive_jpeg_return_backing : NULL)) {
 			case ValidationContinuation::CONTINUE_AS_JPEG:
-				//fprintf(stderr, "CONTINUE AS JPEG...\n");
+				fprintf(stderr, "CONTINUE AS JPEG...\n");
 				is_socket = false;
 				break;
 			case ValidationContinuation::CONTINUE_AS_LEPTON:
@@ -1576,7 +1647,7 @@ void process_file(IOUtil::FileReader *reader,
 					header[0] = lepton_header[0];
 					header[1] = lepton_header[1];
 				}
-				//fprintf(stderr, "CONTINUE AS LEPTON...\n");
+				fprintf(stderr, "CONTINUE AS LEPTON...\n");
 				break;
 			case ValidationContinuation::EVALUATE_AS_PERMISSIVE:
 				if (permissive_jpeg_return_backing.size() == 0) {
@@ -1600,23 +1671,17 @@ void process_file(IOUtil::FileReader *reader,
 					}
 					data_sent += sent;
 				}
-				//fprintf(stderr, "OK...\n");
+				fprintf(stderr, "OK...\n");
 				custom_exit(ExitCode::SUCCESS);
 				break;
 				// Everything is OK
 			case ValidationContinuation::ROUNDTRIP_OK:
+				// Opens up the file descriptor and writes the lepton data to it.
+				// We don't want that. We want to return the data in some function and then use them in WinLep
+
+				//wlep_lepton_data = Sirikata::MuxReader::ResizableByteBuffer(lepton_data);
+
 				fdout = open_fdout(ifilename, writer, embedded_jpeg, header, g_force_zlib0_out || force_zlib0, &is_socket);
-
-				// Write the custom WLep header
-				for (size_t data_sent = 0; data_sent < wlep_header.data.size();) {
-					ssize_t sent = write(fdout, wlep_header.data.data(), wlep_header.data.size());
-
-					if (sent < 0) {
-						continue;
-					}
-
-					data_sent += sent;
-				}
 
 				for (size_t data_sent = 0; data_sent < lepton_data.size();) {
 					ssize_t sent = write(fdout,
@@ -1630,7 +1695,7 @@ void process_file(IOUtil::FileReader *reader,
 					}
 					data_sent += sent;
 				}
-				//fprintf(stderr, "OK...\n");
+				fprintf(stderr, "OK...\n");
 				custom_exit(ExitCode::SUCCESS);
 			case ValidationContinuation::BAD:
 			default:
@@ -1660,324 +1725,325 @@ void process_file(IOUtil::FileReader *reader,
 #else
 					always_assert(false && "ANS-encoded file encountered but ANS not selected in build flags");
 #endif
-				} else {
+			} else {
 					g_encoder.reset(makeEncoder<VPXBoolReader>(g_threaded, g_threaded));
 				}
 				TimingHarness::timing[0][TimingHarness::TS_MODEL_INIT] = TimingHarness::get_time_us();
 				g_decoder = NULL;
-			} else if (g_threaded && (action == socketserve || action == forkserve)) {
-				g_encoder->registerWorkers(get_worker_threads(NUM_THREADS - 1), NUM_THREADS - 1);
-			}
-		} else if (ofiletype == UJG) {
-			g_encoder.reset(new SimpleComponentEncoder);
-			g_decoder = NULL;
+		} else if (g_threaded && (action == socketserve || action == forkserve)) {
+			g_encoder->registerWorkers(get_worker_threads(NUM_THREADS - 1), NUM_THREADS - 1);
 		}
-	} else if (filetype == LEPTON) {
-		NUM_THREADS = read_fixed_ujpg_header();
-		if (NUM_THREADS == 1) {
-			g_threaded = false; // with singlethreaded, doesn't make sense to split out reader/writer
-		}
-		if (!g_decoder) {
-			g_decoder = makeDecoder(g_threaded, g_threaded, ujgversion == 3);
-			TimingHarness::timing[0][TimingHarness::TS_MODEL_INIT] = TimingHarness::get_time_us();
-			g_reference_to_free.reset(g_decoder);
-		} else if (NUM_THREADS > 1 && g_threaded && (action == socketserve || action == forkserve)) {
-			g_decoder->registerWorkers(get_worker_threads(NUM_THREADS), NUM_THREADS);
-		}
-	} else if (filetype == UJG) {
-		(void)read_fixed_ujpg_header();
-		g_decoder = new SimpleComponentDecoder;
+	} else if (ofiletype == UJG) {
+		g_encoder.reset(new SimpleComponentEncoder);
+		g_decoder = NULL;
+	}
+} else if (filetype == LEPTON) {
+	NUM_THREADS = read_fixed_ujpg_header();
+	if (NUM_THREADS == 1) {
+		g_threaded = false; // with singlethreaded, doesn't make sense to split out reader/writer
+	}
+	if (!g_decoder) {
+		g_decoder = makeDecoder(g_threaded, g_threaded, ujgversion == 3);
+		TimingHarness::timing[0][TimingHarness::TS_MODEL_INIT] = TimingHarness::get_time_us();
 		g_reference_to_free.reset(g_decoder);
+	} else if (NUM_THREADS > 1 && g_threaded && (action == socketserve || action == forkserve)) {
+		g_decoder->registerWorkers(get_worker_threads(NUM_THREADS), NUM_THREADS);
 	}
+} else if (filetype == UJG) {
+	(void)read_fixed_ujpg_header();
+	g_decoder = new SimpleComponentDecoder;
+	g_reference_to_free.reset(g_decoder);
+}
 #ifndef _WIN32
-	//FIXME
-	if (g_time_bound_ms) {
-		struct itimerval bound;
-		bound.it_value.tv_sec = g_time_bound_ms / 1000;
-		bound.it_value.tv_usec = (g_time_bound_ms % 1000) * 1000;
-		bound.it_interval.tv_sec = 0;
-		bound.it_interval.tv_usec = 0;
-		int ret = setitimer(ITIMER_REAL, &bound, NULL);
+//FIXME
+if (g_time_bound_ms) {
+	struct itimerval bound;
+	bound.it_value.tv_sec = g_time_bound_ms / 1000;
+	bound.it_value.tv_usec = (g_time_bound_ms % 1000) * 1000;
+	bound.it_interval.tv_sec = 0;
+	bound.it_interval.tv_usec = 0;
+	int ret = setitimer(ITIMER_REAL, &bound, NULL);
 
-		dev_assert(ret == 0 && "Timer must be able to be set");
-		if (ret != 0) {
-			exit((int)ExitCode::OS_ERROR);
-		}
+	dev_assert(ret == 0 && "Timer must be able to be set");
+	if (ret != 0) {
+		exit((int)ExitCode::OS_ERROR);
 	}
+}
 #endif
-	if (g_unkillable) { // only set this after the time bound has been set
-		if (!g_time_bound_ms) {
-			fprintf(stderr, "Only allowed to set unkillable for items with a time bound\n");
-			exit(1);
-		}
-		signal(SIGTERM, &sig_nop);
+if (g_unkillable) { // only set this after the time bound has been set
+	if (!g_time_bound_ms) {
+		fprintf(stderr, "Only allowed to set unkillable for items with a time bound\n");
+		exit(1);
+	}
+	signal(SIGTERM, &sig_nop);
 #ifndef _WIN32
-		signal(SIGQUIT, &sig_nop);
+	signal(SIGQUIT, &sig_nop);
 #endif
-	}
+}
 
-	if (g_use_seccomp) {
-		Sirikata::installStrictSyscallFilter(true);
-	}
+if (g_use_seccomp) {
+	Sirikata::installStrictSyscallFilter(true);
+}
 #ifndef _WIN32
-	if (g_inject_syscall_test == 1) {
-		char buf[128 + 1];
-		buf[sizeof(buf) - 1] = 0;
-		char *ret = getcwd(buf, sizeof(buf) - 1);
-		(void)ret;
-	}
+if (g_inject_syscall_test == 1) {
+	char buf[128 + 1];
+	buf[sizeof(buf) - 1] = 0;
+	char *ret = getcwd(buf, sizeof(buf) - 1);
+	(void)ret;
+}
 #endif
-	// get specific action message
-	if (filetype == UNK) {
-		actionmsg = "unknown filetype";
-	} else if (action == info) {
-		actionmsg = "Parsing";
-	} else if (filetype == JPEG) {
-		actionmsg = "Writing to LEPTON\n";
-	} else {
-		actionmsg = "Decompressing to JPEG\n";
-	}
+// get specific action message
+if (filetype == UNK) {
+	actionmsg = "unknown filetype";
+} else if (action == info) {
+	actionmsg = "Parsing";
+} else if (filetype == JPEG) {
+	actionmsg = "Writing to LEPTON\n";
+} else {
+	actionmsg = "Decompressing to JPEG\n";
+}
 
-	if (verbosity > 0) {
-		while (write(2, actionmsg, strlen(actionmsg)) < 0 && errno == EINTR) {}
-	}
+if (verbosity > 0) {
+	while (write(2, actionmsg, strlen(actionmsg)) < 0 && errno == EINTR) {}
+}
 
-	std::vector<std::pair<uint32_t, uint32_t> > huff_input_offset;
-	if (filetype == JPEG)
+std::vector<std::pair<uint32_t, uint32_t> > huff_input_offset;
+if (filetype == JPEG)
+{
+	switch (action)
 	{
-		switch (action)
-		{
-			case lepton_concatenate:
-				fprintf(stderr, "Unable to concatenate raw JPEG files together\n");
-				custom_exit(ExitCode::VERSION_UNSUPPORTED);
-				break;
-			case comp:
-			case forkserve:
-			case socketserve:
-				timing_operation_start('c');
-				TimingHarness::timing[0][TimingHarness::TS_READ_STARTED] = TimingHarness::get_time_us();
-				{
-					std::vector<uint8_t,
-						Sirikata::JpegAllocator<uint8_t> > jpeg_file_raw_bytes;
-					unsigned int jpg_ident_offset = 2;
-					if (start_byte == 0) {
-						ibytestream str_jpg_in(str_in,
-											   jpg_ident_offset,
-											   Sirikata::JpegAllocator<uint8_t>());
-
-						execute(std::bind(&read_jpeg_wrapper, &huff_input_offset, &str_jpg_in, header, embedded_jpeg));
-					} else {
-						ibytestreamcopier str_jpg_in(str_in,
-													 jpg_ident_offset,
-													 max_file_size,
-													 Sirikata::JpegAllocator<uint8_t>());
-						str_jpg_in.mutate_read_data().push_back(0xff);
-						str_jpg_in.mutate_read_data().push_back(0xd8);
-						execute(std::bind(&read_jpeg_and_copy_to_side_channel,
-										  &huff_input_offset, &str_jpg_in, header,
-										  embedded_jpeg));
-						jpeg_file_raw_bytes.swap(str_jpg_in.mutate_read_data());
-					}
-					TimingHarness::timing[0][TimingHarness::TS_JPEG_DECODE_STARTED] =
-						TimingHarness::timing[0][TimingHarness::TS_READ_FINISHED] = TimingHarness::get_time_us();
-					std::vector<ThreadHandoff> luma_row_offsets;
-					execute(std::bind(&decode_jpeg, huff_input_offset, &luma_row_offsets));
-					TimingHarness::timing[0][TimingHarness::TS_JPEG_DECODE_FINISHED]
-						= TimingHarness::get_time_us();
-					//execute( check_value_range );
-					execute(std::bind(&write_ujpg,
-									  std::move(luma_row_offsets),
-									  jpeg_file_raw_bytes.empty() ? NULL : &jpeg_file_raw_bytes));
-				}
-				timing_operation_complete('c');
-				break;
-
-			case info:
-			{
-				unsigned int jpg_ident_offset = 2;
-				ibytestream str_jpg_in(str_in, jpg_ident_offset, Sirikata::JpegAllocator<uint8_t>());
-				execute(std::bind(read_jpeg_wrapper, &huff_input_offset, &str_jpg_in, header,
-								  embedded_jpeg));
-			}
-			execute(write_info);
+		case lepton_concatenate:
+			fprintf(stderr, "Unable to concatenate raw JPEG files together\n");
+			custom_exit(ExitCode::VERSION_UNSUPPORTED);
 			break;
-		}
-	} else if (filetype == UJG || filetype == LEPTON)
-	{
-		switch (action)
-		{
-			case lepton_concatenate:
-				always_assert(false && "should have been handled above");
-			case comp:
-			case forkserve:
-			case socketserve:
-				if (!g_use_seccomp) {
-					overall_start = clock();
+		case comp:
+		case forkserve:
+		case socketserve:
+			timing_operation_start('c');
+			TimingHarness::timing[0][TimingHarness::TS_READ_STARTED] = TimingHarness::get_time_us();
+			{
+				std::vector<uint8_t,
+					Sirikata::JpegAllocator<uint8_t> > jpeg_file_raw_bytes;
+				unsigned int jpg_ident_offset = 2;
+				if (start_byte == 0) {
+					ibytestream str_jpg_in(str_in,
+										   jpg_ident_offset,
+										   Sirikata::JpegAllocator<uint8_t>());
+
+					execute(std::bind(&read_jpeg_wrapper, &huff_input_offset, &str_jpg_in, header, embedded_jpeg));
+				} else {
+					ibytestreamcopier str_jpg_in(str_in,
+												 jpg_ident_offset,
+												 max_file_size,
+												 Sirikata::JpegAllocator<uint8_t>());
+					str_jpg_in.mutate_read_data().push_back(0xff);
+					str_jpg_in.mutate_read_data().push_back(0xd8);
+					execute(std::bind(&read_jpeg_and_copy_to_side_channel,
+									  &huff_input_offset, &str_jpg_in, header,
+									  embedded_jpeg));
+					jpeg_file_raw_bytes.swap(str_jpg_in.mutate_read_data());
 				}
-				timing_operation_start('d');
-				TimingHarness::timing[0][TimingHarness::TS_READ_STARTED] = TimingHarness::get_time_us();
-				while (true) {
-					execute(read_ujpg); // replace with decompression function!
+				TimingHarness::timing[0][TimingHarness::TS_JPEG_DECODE_STARTED] =
 					TimingHarness::timing[0][TimingHarness::TS_READ_FINISHED] = TimingHarness::get_time_us();
-					if (!g_use_seccomp) {
-						read_done = clock();
-					}
-					TimingHarness::timing[0][TimingHarness::TS_JPEG_RECODE_STARTED] = TimingHarness::get_time_us();
-					if (filetype != UJG && !g_allow_progressive) {
-						execute(recode_baseline_jpeg_wrapper);
-					} else {
-						execute(recode_jpeg);
-					}
-					timing_operation_complete('d');
-					TimingHarness::timing[0][TimingHarness::TS_JPEG_RECODE_FINISHED] = TimingHarness::get_time_us();
-					Sirikata::Array1d<uint8_t, 6> trailer_new_header;
-					std::pair<uint32_t, Sirikata::JpegError> continuity;
-					size_t off = 0;
-					while (off < trailer_new_header.size()) {
-						continuity = str_in->Read(&trailer_new_header[off], trailer_new_header.size() - off);
-						off += continuity.first;
-						if (continuity.second != Sirikata::JpegError::nil()) {
-							break;
-						}
-					}
+				std::vector<ThreadHandoff> luma_row_offsets;
+				execute(std::bind(&decode_jpeg, huff_input_offset, &luma_row_offsets));
+				TimingHarness::timing[0][TimingHarness::TS_JPEG_DECODE_FINISHED]
+					= TimingHarness::get_time_us();
+				//execute( check_value_range );
+				execute(std::bind(&write_ujpg,
+								  std::move(luma_row_offsets),
+								  jpeg_file_raw_bytes.empty() ? NULL : &jpeg_file_raw_bytes));
+			}
+			timing_operation_complete('c');
+			break;
+
+		case info:
+		{
+			unsigned int jpg_ident_offset = 2;
+			ibytestream str_jpg_in(str_in, jpg_ident_offset, Sirikata::JpegAllocator<uint8_t>());
+			execute(std::bind(read_jpeg_wrapper, &huff_input_offset, &str_jpg_in, header,
+							  embedded_jpeg));
+		}
+		execute(write_info);
+		break;
+	}
+} else if (filetype == UJG || filetype == LEPTON)
+{
+	switch (action)
+	{
+		case lepton_concatenate:
+			always_assert(false && "should have been handled above");
+		case comp:
+		case forkserve:
+		case socketserve:
+			if (!g_use_seccomp) {
+				overall_start = clock();
+			}
+			timing_operation_start('d');
+			TimingHarness::timing[0][TimingHarness::TS_READ_STARTED] = TimingHarness::get_time_us();
+			while (true) {
+				execute(read_ujpg); // replace with decompression function!
+				TimingHarness::timing[0][TimingHarness::TS_READ_FINISHED] = TimingHarness::get_time_us();
+				if (!g_use_seccomp) {
+					read_done = clock();
+				}
+				TimingHarness::timing[0][TimingHarness::TS_JPEG_RECODE_STARTED] = TimingHarness::get_time_us();
+				if (filetype != UJG && !g_allow_progressive) {
+					execute(recode_baseline_jpeg_wrapper);
+				} else {
+					execute(recode_jpeg);
+				}
+				timing_operation_complete('d');
+				TimingHarness::timing[0][TimingHarness::TS_JPEG_RECODE_FINISHED] = TimingHarness::get_time_us();
+				Sirikata::Array1d<uint8_t, 6> trailer_new_header;
+				std::pair<uint32_t, Sirikata::JpegError> continuity;
+				size_t off = 0;
+				while (off < trailer_new_header.size()) {
+					continuity = str_in->Read(&trailer_new_header[off], trailer_new_header.size() - off);
+					off += continuity.first;
 					if (continuity.second != Sirikata::JpegError::nil()) {
 						break;
-					} else if (trailer_new_header[4] != header[0] || trailer_new_header[5] != header[1]) {
-						break;
-					} else {
-						prep_for_new_file();
 					}
 				}
-				str_out->close();
-				break;
-			case info:
-				execute(read_ujpg);
-				execute(write_info);
-				break;
-		}
-	}
-	if (!fast_exit) {
-		// close iostreams
-		if (str_in != NULL) delete(str_in); str_in = NULL;
-		if (str_out != NULL) delete(str_out); str_out = NULL;
-		if (ujg_out != NULL) delete(ujg_out); ujg_out = NULL;
-		// delete if broken or if output not needed
-		if ((!pipe_on) && ((errorlevel.load() >= err_tresh)
-						   || (action != comp && action != forkserve && action != socketserve))) {
-			// FIXME: can't delete broken output--it's gone already
-		}
-	}
-	TimingHarness::timing[0][TimingHarness::TS_DONE] = TimingHarness::get_time_us();
-	TimingHarness::print_results();
-	if (!g_use_seccomp) {
-		end = clock();
-	}
-	{
-		size_t bound = decompression_memory_bound();
-		char bound_out[] = "XXXXXXXXXX bytes needed to decompress this file\n";
-		bound_out[0] = '0' + (bound / 1000000000) % 10;
-		bound_out[1] = '0' + (bound / 100000000) % 10;
-		bound_out[2] = '0' + (bound / 10000000) % 10;
-		bound_out[3] = '0' + (bound / 1000000) % 10;
-		bound_out[4] = '0' + (bound / 100000) % 10;
-		bound_out[5] = '0' + (bound / 10000) % 10;
-		bound_out[6] = '0' + (bound / 1000) % 10;
-		bound_out[7] = '0' + (bound / 100) % 10;
-		bound_out[8] = '0' + (bound / 10) % 10;
-		bound_out[9] = '0' + (bound / 1) % 10;
-		const char *to_write = bound_out;
-		while (to_write[0] == '0') {
-			++to_write;
-		}
-		while (write(2, to_write, strlen(to_write)) < 0 && errno == EINTR) {
-		}
-	}
-	print_bill(2);
-	// speed and compression ratio calculation
-	speed = (int)((double)((end - begin) * 1000) / CLOCKS_PER_SEC);
-	bpms = (speed > 0) ? (jpgfilesize / speed) : jpgfilesize;
-	cr = (jpgfilesize > 0) ? (100.0 * ujgfilesize / jpgfilesize) : 0;
-
-	switch (verbosity)
-	{
-		case 0:
-			if (errorlevel.load() < err_tresh) {
-				if (action == comp) {
-					fprintf(stderr, "%d %d\n", (int)ujgfilesize, (int)jpgfilesize);
-					char percentage_report[] = " XX.XX%\n";
-					double pct = cr + .005;
-					percentage_report[0] = '0' + (int)(pct / 100) % 10;
-					percentage_report[1] = '0' + (int)(pct / 10) % 10;
-					percentage_report[2] = '0' + (int)(pct) % 10;
-					percentage_report[4] = '0' + (int)(pct * 10) % 10;
-					percentage_report[5] = '0' + (int)(pct * 100) % 10;
-					char *output = percentage_report;
-					if (cr < 100) {
-						++output;
-					}
-					while (write(2, output, strlen(output)) < 0 && errno == EINTR) {
-					}
+				if (continuity.second != Sirikata::JpegError::nil()) {
+					break;
+				} else if (trailer_new_header[4] != header[0] || trailer_new_header[5] != header[1]) {
+					break;
 				} else {
-					fprintf(msgout, "DONE\n");
+					prep_for_new_file();
 				}
 			}
+			str_out->close();
 			break;
-
-		case 1:
-			if (errorlevel.load() < err_tresh) fprintf(msgout, "DONE\n");
-			else fprintf(msgout, "ERROR\n");
-			break;
-
-		case 2:
-			fprintf(msgout, "\n----------------------------------------\n");
-			if (errorlevel.load() < err_tresh) fprintf(msgout, "-> %s OK\n", actionmsg);
+		case info:
+			execute(read_ujpg);
+			execute(write_info);
 			break;
 	}
-
-	switch (errorlevel.load())
-	{
-		case 0:
-			errtypemsg = "none";
-			break;
-
-		case 1:
-			if (errorlevel.load() < err_tresh)
-				errtypemsg = "warning (ignored)";
-			else
-				errtypemsg = "warning (skipped file)";
-			break;
-
-		case 2:
-			errtypemsg = "fatal error";
-			break;
+}
+if (!fast_exit) {
+	// close iostreams
+	if (str_in != NULL) delete(str_in); str_in = NULL;
+	if (str_out != NULL) delete(str_out); str_out = NULL;
+	if (ujg_out != NULL) delete(ujg_out); ujg_out = NULL;
+	// delete if broken or if output not needed
+	if ((!pipe_on) && ((errorlevel.load() >= err_tresh)
+					   || (action != comp && action != forkserve && action != socketserve))) {
+		// FIXME: can't delete broken output--it's gone already
 	}
+}
+TimingHarness::timing[0][TimingHarness::TS_DONE] = TimingHarness::get_time_us();
+// FIXME: Dont print timing for now ...
+//TimingHarness::print_results();
+if (!g_use_seccomp) {
+	end = clock();
+}
+{
+	size_t bound = decompression_memory_bound();
+	char bound_out[] = "XXXXXXXXXX bytes needed to decompress this file\n";
+	bound_out[0] = '0' + (bound / 1000000000) % 10;
+	bound_out[1] = '0' + (bound / 100000000) % 10;
+	bound_out[2] = '0' + (bound / 10000000) % 10;
+	bound_out[3] = '0' + (bound / 1000000) % 10;
+	bound_out[4] = '0' + (bound / 100000) % 10;
+	bound_out[5] = '0' + (bound / 10000) % 10;
+	bound_out[6] = '0' + (bound / 1000) % 10;
+	bound_out[7] = '0' + (bound / 100) % 10;
+	bound_out[8] = '0' + (bound / 10) % 10;
+	bound_out[9] = '0' + (bound / 1) % 10;
+	const char *to_write = bound_out;
+	while (to_write[0] == '0') {
+		++to_write;
+	}
+	while (write(2, to_write, strlen(to_write)) < 0 && errno == EINTR) {
+	}
+}
+print_bill(2);
+// speed and compression ratio calculation
+speed = (int)((double)((end - begin) * 1000) / CLOCKS_PER_SEC);
+bpms = (speed > 0) ? (jpgfilesize / speed) : jpgfilesize;
+cr = (jpgfilesize > 0) ? (100.0 * ujgfilesize / jpgfilesize) : 0;
 
-	if (errorlevel.load() > 0)
-	{
-		if (false && action != socketserve && action != forkserve) {
-			fprintf(stderr, " %s:\n", errtypemsg);
-			fprintf(stderr, " %s\n", errormessage.c_str());
-			if (verbosity > 1)
-				fprintf(stderr, " (in file \"%s\")\n", filelist[file_no]);
+switch (verbosity)
+{
+	case 0:
+		if (errorlevel.load() < err_tresh) {
+			if (action == comp) {
+				fprintf(stderr, "%d %d\n", (int)ujgfilesize, (int)jpgfilesize);
+				char percentage_report[] = " XX.XX%\n";
+				double pct = cr + .005;
+				percentage_report[0] = '0' + (int)(pct / 100) % 10;
+				percentage_report[1] = '0' + (int)(pct / 10) % 10;
+				percentage_report[2] = '0' + (int)(pct) % 10;
+				percentage_report[4] = '0' + (int)(pct * 10) % 10;
+				percentage_report[5] = '0' + (int)(pct * 100) % 10;
+				char *output = percentage_report;
+				if (cr < 100) {
+					++output;
+				}
+				while (write(2, output, strlen(output)) < 0 && errno == EINTR) {
+				}
+			} else {
+				fprintf(msgout, "DONE\n");
+			}
 		}
-	}
-	if ((verbosity > 0) && (errorlevel.load() < err_tresh))
-		if (action == comp)
-		{
-			fprintf(msgout, " time taken  : %7i msec\n", speed);
-			fprintf(msgout, " byte per ms : %7i byte\n", bpms);
-			fprintf(msgout, " comp. ratio : %7.2f %%\n", cr);
-		}
+		break;
 
-	if ((verbosity > 1) && (action == comp))
-		fprintf(msgout, "\n");
-	LeptonDebug::dumpDebugData();
-	if (errorlevel.load()) {
-		custom_exit(ExitCode::UNSUPPORTED_JPEG); // custom exit will delete generic_workers
-	} else {
-		custom_exit(ExitCode::SUCCESS);
+	case 1:
+		if (errorlevel.load() < err_tresh) fprintf(msgout, "DONE\n");
+		else fprintf(msgout, "ERROR\n");
+		break;
+
+	case 2:
+		fprintf(msgout, "\n----------------------------------------\n");
+		if (errorlevel.load() < err_tresh) fprintf(msgout, "-> %s OK\n", actionmsg);
+		break;
+}
+
+switch (errorlevel.load())
+{
+	case 0:
+		errtypemsg = "none";
+		break;
+
+	case 1:
+		if (errorlevel.load() < err_tresh)
+			errtypemsg = "warning (ignored)";
+		else
+			errtypemsg = "warning (skipped file)";
+		break;
+
+	case 2:
+		errtypemsg = "fatal error";
+		break;
+}
+
+if (errorlevel.load() > 0)
+{
+	if (false && action != socketserve && action != forkserve) {
+		fprintf(stderr, " %s:\n", errtypemsg);
+		fprintf(stderr, " %s\n", errormessage.c_str());
+		if (verbosity > 1)
+			fprintf(stderr, " (in file \"%s\")\n", filelist[file_no]);
 	}
-	reset_buffers();
+}
+if ((verbosity > 0) && (errorlevel.load() < err_tresh))
+	if (action == comp)
+	{
+		fprintf(msgout, " time taken  : %7i msec\n", speed);
+		fprintf(msgout, " byte per ms : %7i byte\n", bpms);
+		fprintf(msgout, " comp. ratio : %7.2f %%\n", cr);
+	}
+
+if ((verbosity > 1) && (action == comp))
+fprintf(msgout, "\n");
+LeptonDebug::dumpDebugData();
+if (errorlevel.load()) {
+	custom_exit(ExitCode::UNSUPPORTED_JPEG); // custom exit will delete generic_workers
+} else {
+	custom_exit(ExitCode::SUCCESS);
+}
+reset_buffers();
 }
 
 /* -----------------------------------------------
@@ -3732,7 +3798,7 @@ bool write_ujpg(std::vector<ThreadHandoff> row_thread_handoffs,
 				(int)row_thread_handoffs[i].last_dc[0],
 				(int)row_thread_handoffs[i].last_dc[1],
 				(int)row_thread_handoffs[i].last_dc[2]);
-	}
+}
 #endif
 	uint32_t framebuffer_byte_size = row_thread_handoffs.back().segment_size - row_thread_handoffs.front().segment_size;
 	uint32_t num_rows = row_thread_handoffs.size();
@@ -3823,7 +3889,7 @@ bool write_ujpg(std::vector<ThreadHandoff> row_thread_handoffs,
 				(int)selected_splits[i].last_dc[0],
 				(int)selected_splits[i].last_dc[1],
 				(int)selected_splits[i].last_dc[2]);
-	}
+		}
 #endif
 
 	always_assert(start_byte || !selected_splits[0].luma_y_start);
@@ -3970,7 +4036,7 @@ bool write_ujpg(std::vector<ThreadHandoff> row_thread_handoffs,
 	}
 
 	return true;
-}
+	}
 
 /* -----------------------------------------------
 	read uncompressed JPEG file
@@ -5214,7 +5280,7 @@ int next_huffcode(abitreader *huffw, huffTree *ctree, Billing min_bill, Billing 
 		write_bit_bill(min_bill, false, 1);
 		if (min_bill != max_bill) {
 			min_bill = (Billing)((int)min_bill + 1);
-		}
+}
 #endif
 		node = (huffw->read(1) == 1) ?
 			ctree->r[node] : ctree->l[node];
